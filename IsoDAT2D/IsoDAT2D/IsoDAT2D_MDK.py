@@ -8,7 +8,9 @@ import SimDAT2D as sim
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd 
+import sklearn
 from sklearn.decomposition import NMF
+from sklearn.decomposition import FastICA
 import dask
 import glob as glob
 from tifffile import imread, imshow
@@ -16,7 +18,8 @@ import warnings
 import dask
 import nimfa
 import pyFAI
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering, DBSCAN
+from sklearn.preprocessing import StandardScaler
 from SimDAT2D import masking
 
 def attempt(Real_Data, Length, i, init= None, solver = 'cd', beta_loss = 'frobenius', iter = 500):
@@ -86,6 +89,51 @@ def Run_NMF(Real_Data, init= None, solver = 'cd', beta_loss = 'frobenius', itear
     
     return m,NMF_Data_2, min_Q
 
+def try_ICA(Real_Data, n_components, max_iter=1000, show=False):
+    """A function that will run the Independent Component Analysis (ICA) algorithm on the data"""
+    
+    ICA_model = FastICA(n_components=n_components, max_iter=max_iter)
+    ICA_data = ICA_model.fit_transform(Real_Data)
+    fit_compos = ICA_model.components_
+    # Note: FastICA does not have a reconstruction error attribute
+    # You might need to calculate a custom error metric if needed
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    return fit_compos, ICA_data
+
+def Run_ICA(Real_Data, max_iter=1000, show=False):
+    In = None
+    Solve = 'cd'
+    Beta = 'frobenius'
+    It = 1000
+    
+    jobs = [dask.delayed(attempt)(Real_Data, Real_Data.shape[1], i, In, Solve, Beta, It) for i in range(1, Real_Data.shape[1])]
+    #jobs = [dask.delayed(attempt)(Real_Data, Real_Data.shape[1], i, In, Solve, Beta, It) for i in range(1,20)]
+    calcs = dask.compute(jobs)[0]
+
+    calcs = np.array(calcs)
+    min_Q = np.min(calcs)
+    noc = np.where(calcs == min_Q)
+    noc_2 = noc[0]
+    number_of_components = noc_2[0] +1
+
+    Divergence, ICA_Data = try_ICA(Real_Data, number_of_components, max_iter)
+            
+    print('The beta-divergence is: ', Divergence, '%\n','The final number of components used were',number_of_components+1, '\n') 
+     
+    m = pd.DataFrame(ICA_Data)
+    m = m.T
+    
+    if show == True:
+        plt.figure(figsize = (5,5))
+        colors = plt.cm.magma(np.linspace(0,1, number_of_components))
+        i = 0
+        while i < number_of_components:
+            plt.plot(m[i], c = colors[i], alpha = 0.7)
+            i = i+1
+    
+    return m, ICA_Data, min_Q
+
+
 #masking algoirthm to create masks for the data
 
 def make_masks(array, slices, offset = 5, width=.5, gits = False):
@@ -111,22 +159,29 @@ def AggCluster(Number_Clusters, data):
         the 'latent' space from the clustering algorithms have more meaning"""
 
     from sklearn.cluster import AgglomerativeClustering
-    Make_Clusters= AgglomerativeClustering(n_clusters = Number_Clusters, compute_distances=True)
-    y_kmeans = Make_Clusters.fit_predict(data)
-    information = Make_Clusters.fit(data)
+    Make_Clusters= AgglomerativeClustering(n_clusters = Number_Clusters, compute_distances = True)
+
+    # Convert DataFrame to numpy array if needed
+    if isinstance(data, pd.DataFrame):
+        data_array = data.values
+    else:
+        data_array = data
+        
+    y_kmeans = Make_Clusters.fit_predict(data_array)
+    information = Make_Clusters.fit(data_array)
     parameter = information.distances_
 
     x = 0
-    Understanding_data = {"Cluster_Number":[], "Int_Angle":[]};
-    while x < len(data):
+    Understanding_data = {"Cluster_Number":[], "Int_Angle":[], "Label":[]}
+    while x < len(data_array):
         Understanding_data["Cluster_Number"].append(y_kmeans[x])
-        Understanding_data["Int_Angle"].append(data[x])
+        Understanding_data["Int_Angle"].append(data_array[x])
+        Understanding_data["Label"].append(data_array.columns[x])
         x = x+1
         
     # Create an empty list to store the data
     data_list = []
-    
-        
+      
     q = 0
     while q < Number_Clusters:
         z = 0
@@ -135,7 +190,7 @@ def AggCluster(Number_Clusters, data):
         plt.ylabel('Y')
         plt.title('Agglomerative Clustering'+' ' +str(q))
 
-        while z < len(data):
+        while z < len(data_array):
             if Understanding_data["Cluster_Number"][z] == q:
                 plt.plot(Understanding_data["Int_Angle"][z], label = 'Component'+str(z))
             z = z+1
@@ -146,14 +201,80 @@ def AggCluster(Number_Clusters, data):
         
         if input("Do the identified components look like an isotropic scattering signal? (y/n)") == 'y':
             i = 0
-            while i < len(data):
+            while i < len(data_array):
                 if Understanding_data["Cluster_Number"][i] == q:
                     data_list.append(Understanding_data["Int_Angle"][i])
                 i = i+1
                 
-        q = q+1
+        q = q + 1
     
     return Understanding_data, data_list
+
+def AggCluster_labels(n_clusters, data):
+    
+    """A program that will take in the type of scikitlearn clustering algorithm
+        desired and the number of clusters as well as the data in a numpy array
+        and output the associated clusters with the original data. This will make
+        the 'latent' space from the clustering algorithms have more meaning
+        take in labeled data and output the clusters with the labels. 
+        ignore labels during clustering but keep them for after"""
+
+    """
+    data: a DataFrame whose rows are indexed by a MultiIndex
+          (level 0 = 'isotropic' or 'anisotropic', level 1 = angle)
+          and whose columns are the intensity values at each q.
+    Returns:
+      - results_df: same rows + all numeric cols + a 'cluster' column
+      - data_list:  a list of np.ndarray, one per cluster
+    """
+    from sklearn.cluster import AgglomerativeClustering
+    # 1) pull out labels
+    types  = data.index.get_level_values(0).to_numpy()  # e.g. ['isotropic', ...] = source_label
+    angles = data.index.get_level_values(1).to_numpy()  # e.g. [0.0, 10.0, ...] = angle_label
+    
+    # 2) numeric matrix
+    X      = data.values  # shape = (n_samples, n_features)
+    
+    # 3) cluster
+    model     = AgglomerativeClustering(
+                   n_clusters=n_clusters,
+                   compute_distances=True
+                )
+    clusters  = model.fit_predict(X)  # length = n_samples
+    
+    # 4) rebuild a Results DataFrame
+    results_df = pd.DataFrame(
+      X,
+      index=pd.MultiIndex.from_arrays([types, angles],
+                                      names=['type','angle']),
+      columns=data.columns
+    )
+    results_df['cluster'] = clusters
+    
+    # 5) build your data_list exactly like before
+    data_list = []
+    for k in range(n_clusters):
+        # each is an array of shape (n_k, n_features)
+        data_list.append(results_df
+                         .loc[results_df['cluster']==k, 
+                              data.columns]  # drop the cluster col
+                         .values)
+    
+    # 6) interactive plotting step
+    for k in range(n_clusters):
+        plt.figure(figsize=(5,5))
+        plt.title(f"Agglomerative Clustering {k}")
+        plt.xlabel("x-axis")
+        plt.ylabel("Intensity")
+        subset = results_df[results_df['cluster']==k]
+        for _, row in subset[data.columns].iterrows():
+            plt.plot(row.values, alpha=0.5)
+        plt.show()
+        if input("Keep these signals as ‘isotropic’? (y/n) ") == 'n':
+            # if no, clear that cluster’s data
+            data_list[k] = []
+    
+    return results_df, data_list
 
 
 def smooth_components(Identified_components, filter_strength = 2, show = False):
@@ -190,6 +311,70 @@ def smooth_components(Identified_components, filter_strength = 2, show = False):
     
     # Returning the smoothed components
     return smoothed_compos
+
+def cluster_only(data, method='agglomerative', n_clusters=2, affinity='euclidean', linkage='ward', dbscan_eps=0.5, dbscan_min_samples=5, plot=True):
+    """
+    Cluster data using Agglomerative Clustering or DBSCAN, with preprocessing.
+
+    Parameters:
+        data: np.ndarray or pd.DataFrame
+        method: 'agglomerative' or 'dbscan'
+        n_clusters: number of clusters (for agglomerative)
+        affinity: distance metric for agglomerative ('euclidean', 'manhattan', 'cosine', etc.)
+        linkage: linkage for agglomerative ('ward', 'average', 'complete', 'single')
+        dbscan_eps: epsilon for DBSCAN
+        dbscan_min_samples: min_samples for DBSCAN
+        plot: whether to plot the results (PCA 2D)
+
+    Returns:
+        cluster_labels: array of cluster assignments
+    """
+    # Convert DataFrame to numpy array if needed
+    if hasattr(data, 'values'):
+        data = data.values
+
+    # Standardize the data
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(data)
+
+    # Choose clustering method
+    if method == 'agglomerative':
+        skl_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
+        kwargs = dict(n_clusters=n_clusters, linkage=linkage)
+        if skl_version >= (1, 2):
+            kwargs['metric'] = affinity
+        else:
+            kwargs['affinity'] = affinity
+        clusterer = AgglomerativeClustering(**kwargs)
+    elif method == 'dbscan':
+        clusterer = DBSCAN(
+            eps=dbscan_eps,
+            min_samples=dbscan_min_samples,
+            metric=affinity
+        )
+    else:
+        raise ValueError("method must be 'agglomerative' or 'dbscan'")
+
+    cluster_labels = clusterer.fit_predict(data_scaled)
+
+    # Optional: plot clusters in 2D using PCA
+    if plot:
+        try:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=2)
+            data_2d = pca.fit_transform(data_scaled)
+            plt.figure(figsize=(6, 5))
+            scatter = plt.scatter(data_2d[:, 0], data_2d[:, 1], c=cluster_labels, cmap='tab10', s=30)
+            plt.title(f"{method.capitalize()} Clustering Results")
+            plt.xlabel("PCA 1")
+            plt.ylabel("PCA 2")
+            plt.colorbar(scatter, label='Cluster')
+            plt.show()
+        except Exception as e:
+            print("Plotting failed:", e)
+
+    return cluster_labels
+
 
 import pyFAI.azimuthalIntegrator as AI
 import pyopencl.array as cla
@@ -349,15 +534,10 @@ def run_HAC(Number_Clusters, data):
     and output the associated clusters with the original data. This will make
     the 'latent' space from the clustering algorithms have more meaning"""
     
-    # data_list = []
-    # i = 0
-    # while i < len(basis_data.T)-1:
-    #     data_list.append(basis_data[:,i])
-    #     i += 1
-    # data = np.array(data_list)
+    # Convert DataFrame to numpy array if needed
+    if isinstance(data, pd.DataFrame):
+        data = data.values
     
-    # print(data.shape)
-
     # Initialize and fit the Agglomerative Clustering model
     Make_Clusters = AgglomerativeClustering(n_clusters=Number_Clusters, compute_distances=True)
     y_kmeans = Make_Clusters.fit_predict(data)
@@ -796,7 +976,7 @@ import matplotlib.pyplot as plt
 
 def cluster_results_basis(W_matrix, n_clusters):
     """
-    Cluster the NMF results using agglomerative clustering on the basis matrix and return the clusters.
+    Cluster the NMF results using agglomerative clustering on the basis matrix with improved preprocessing and visualization.
 
     Parameters:
     - W_matrix: Basis matrix from NMF.
@@ -805,9 +985,20 @@ def cluster_results_basis(W_matrix, n_clusters):
     Returns:
     - cluster_dict: Dictionary with cluster assignments and associated components.
     """
-    # Perform agglomerative clustering on the W matrix
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import silhouette_score
+    
+    # Preprocess the data
+    scaler = StandardScaler()
+    W_scaled = scaler.fit_transform(W_matrix.T)
+    
+    # Perform agglomerative clustering
     clustering = AgglomerativeClustering(n_clusters=n_clusters)
-    clusters = clustering.fit_predict(W_matrix.T)
+    clusters = clustering.fit_predict(W_scaled)
+    
+    # Calculate silhouette score
+    silhouette_avg = silhouette_score(W_scaled, clusters)
+    print(f"Average silhouette score: {silhouette_avg:.3f}")
     
     # Create a dictionary to store cluster assignments and associated components
     cluster_dict = {i: [] for i in range(n_clusters)}
@@ -815,18 +1006,47 @@ def cluster_results_basis(W_matrix, n_clusters):
     for i, cluster in enumerate(clusters):
         cluster_dict[cluster].append(W_matrix[:, i])
     
-    # Plot the clusters
+    # Plot the clusters with improved visualization
     for cluster, components in cluster_dict.items():
-        plt.figure(figsize=(6, 6))
-        colors = plt.cm.plasma(np.linspace(0, 1, len(components)))
+        plt.figure(figsize=(12, 6))
         
+        # Plot individual components
+        plt.subplot(1, 2, 1)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(components)))
         for i, component in enumerate(components):
-            plt.plot(component + i * 0.1, label='Component {}'.format(i + 1), color=colors[i])
+            # Normalize component for better visualization
+            normalized_component = (component - np.min(component)) / (np.max(component) - np.min(component))
+            plt.plot(normalized_component, label=f'Component {i+1}', color=colors[i], alpha=0.7)
         
-        plt.title('Cluster {} Components'.format(cluster))
+        plt.title(f'Cluster {cluster} Components')
         plt.xlabel('Data Points')
-        plt.ylabel('Components')
+        plt.ylabel('Normalized Intensity')
         plt.grid(True)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # Plot mean component with standard deviation
+        plt.subplot(1, 2, 2)
+        components_array = np.array(components)
+        mean_component = np.mean(components_array, axis=0)
+        std_component = np.std(components_array, axis=0)
+        
+        # Normalize mean component
+        normalized_mean = (mean_component - np.min(mean_component)) / (np.max(mean_component) - np.min(mean_component))
+        normalized_std = std_component / (np.max(mean_component) - np.min(mean_component))
+        
+        plt.plot(normalized_mean, 'k-', label='Mean Component', linewidth=2)
+        plt.fill_between(range(len(normalized_mean)), 
+                        normalized_mean - normalized_std,
+                        normalized_mean + normalized_std,
+                        alpha=0.2, color='gray', label='±1 std')
+        
+        plt.title(f'Cluster {cluster} Statistics')
+        plt.xlabel('Data Points')
+        plt.ylabel('Normalized Intensity')
+        plt.grid(True)
+        plt.legend()
+        
+        plt.tight_layout()
         plt.show()
     
     return cluster_dict
@@ -1020,6 +1240,68 @@ def cluster_results_basis_hdbscan(W_matrix, min_cluster_size = 10, min_samples =
 def run_sklearn_nmf_and_agg_cluster(data, max_components, max_iter=600, init='random', solver='cd', tol=1e-4, patience=5, n_clusters=5, cluster_matrix = 'W'):
     """
     Run NMF using the sklearn library with flexible parameters and cluster the results using agglomerative clustering.
+    Includes improved preprocessing and evaluation.
+
+    Parameters:
+    - data: Input data matrix.
+    - max_components: Maximum number of components to try.
+    - max_iter: Maximum number of iterations (default: 600).
+    - init: Initialization method (default: 'random').
+    - solver: Solver to use (default: 'cd').
+    - tol: Tolerance for error change to consider it stabilized (default: 1e-4).
+    - patience: Number of runs to wait for error stabilization (default: 5).
+    - n_clusters: Number of clusters to create. If None, automatically selects optimal number.
+    - cluster_matrix: Which matrix to cluster ('W' or 'H').
+
+    Returns:
+    - best_W: Best basis matrix.
+    - best_H: Best coefficient matrix.
+    - best_reconstruction_err: Best reconstruction error.
+    - clusters: Cluster assignments for the NMF results.
+    """
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import silhouette_score
+    from scipy.spatial.distance import correlation
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    # Run NMF
+    best_W, best_H, best_reconstruction_err = run_sklearn_nmf(data, max_components, max_iter, init, solver, tol, patience)
+    
+    # Preprocess the data for clustering
+    scaler = StandardScaler()
+    if cluster_matrix == 'W':
+        data_to_cluster = scaler.fit_transform(best_W.T)
+    else:
+        data_to_cluster = scaler.fit_transform(best_H)
+    
+    # Compute correlation distance matrix
+    dist_matrix = np.zeros((data_to_cluster.shape[0], data_to_cluster.shape[0]))
+    for i in range(data_to_cluster.shape[0]):
+        for j in range(data_to_cluster.shape[0]):
+            dist_matrix[i,j] = correlation(data_to_cluster[i], data_to_cluster[j])
+    
+    # Plot correlation matrix of all components
+    plt.figure(figsize=(10, 8))
+    corr_matrix = np.corrcoef(data_to_cluster)
+    plt.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+    plt.colorbar(label='Correlation')
+    plt.title('Correlation Matrix of All Components')
+    plt.show()
+    
+    # Perform final clustering
+    if cluster_matrix == 'W':
+        data_dict = cluster_results_basis(best_W, n_clusters)
+    else:
+        data_dict = cluster_results_weights(best_H, best_W, n_clusters)
+    
+    return best_W, best_H, best_reconstruction_err, data_dict
+
+
+def run_sklearn_nmf_and_agg_cluster_orig(data, max_components, max_iter=600, init='random', solver='cd', tol=1e-4, patience=5, n_clusters=5, cluster_matrix = 'W'):
+    """
+    Run NMF using the sklearn library with flexible parameters and cluster the results using agglomerative clustering.
+    Includes improved preprocessing and evaluation.
 
     Parameters:
     - data: Input data matrix.
@@ -1030,6 +1312,7 @@ def run_sklearn_nmf_and_agg_cluster(data, max_components, max_iter=600, init='ra
     - tol: Tolerance for error change to consider it stabilized (default: 1e-4).
     - patience: Number of runs to wait for error stabilization (default: 5).
     - n_clusters: Number of clusters to create.
+    - cluster_matrix: Which matrix to cluster ('W' or 'H').
 
     Returns:
     - best_W: Best basis matrix.
@@ -1037,14 +1320,54 @@ def run_sklearn_nmf_and_agg_cluster(data, max_components, max_iter=600, init='ra
     - best_reconstruction_err: Best reconstruction error.
     - clusters: Cluster assignments for the NMF results.
     """
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import silhouette_score
+    import numpy as np
+    import matplotlib.pyplot as plt
     
+    # Run NMF
     best_W, best_H, best_reconstruction_err = run_sklearn_nmf(data, max_components, max_iter, init, solver, tol, patience)
+    
+    # Preprocess the data for clustering
+    scaler = StandardScaler()
     if cluster_matrix == 'W':
-        data_dict = cluster_results_basis(best_W, n_clusters)
+        data_to_cluster = scaler.fit_transform(best_W.T)
     else:
-        data_dict = cluster_results_weights(best_H, best_W, n_clusters)
+        data_to_cluster = scaler.fit_transform(best_H)
+    
+    # Try different numbers of clusters to find optimal
+    silhouette_scores = []
+    max_clusters = min(10, len(data_to_cluster) - 1)  # Don't try more clusters than samples
+    n_clusters_range = range(2, max_clusters + 1)
+    
+    for n in n_clusters_range:
+        clustering = AgglomerativeClustering(n_clusters=n)
+        clusters = clustering.fit_predict(data_to_cluster)
+        score = silhouette_score(data_to_cluster, clusters)
+        silhouette_scores.append(score)
+    
+    # Plot silhouette scores
+    plt.figure(figsize=(10, 6))
+    plt.plot(n_clusters_range, silhouette_scores, 'bo-')
+    plt.xlabel('Number of Clusters')
+    plt.ylabel('Silhouette Score')
+    plt.title('Silhouette Score vs Number of Clusters')
+    plt.grid(True)
+    plt.show()
+    
+    # Use the optimal number of clusters
+    optimal_n_clusters = n_clusters_range[np.argmax(silhouette_scores)]
+    print(f"Optimal number of clusters: {optimal_n_clusters}")
+    
+    # Perform final clustering with optimal number of clusters
+    if cluster_matrix == 'W':
+        data_dict = cluster_results_basis(best_W, optimal_n_clusters)
+    else:
+        data_dict = cluster_results_weights(best_H, best_W, optimal_n_clusters)
     
     return best_W, best_H, best_reconstruction_err, data_dict
+
+    
 
 def run_sklearn_nmf_and_dbscan(data, max_components, max_iter=600, init='random', solver='cd', tol=1e-4, patience=5, eps = 10, min_samples = 5, cluster_matrix = 'W'):
     """
