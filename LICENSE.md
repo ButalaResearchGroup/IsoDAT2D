@@ -1,6 +1,7 @@
 BSD 3-Clause License
 
 Copyright (c) 2025, Danielle N. Alverson
+Copyright (c) 2025, Megan M. Butala
 Copyright (c) 2026, Marisa D. Kelley
 
 All rights reserved.
